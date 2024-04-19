@@ -8,6 +8,7 @@
 
 use embassy_executor::Spawner;
 
+use embassy_rp::config;
 // USB driver
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_rp::{bind_interrupts, peripherals::USB};
@@ -19,7 +20,7 @@ use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 
 // Futures
 use embassy_futures::join::{join, Join};
-use embassy_futures::select::Select;
+use embassy_futures::select::{select, Select};
 use embassy_futures::select::Either::{First, Second};
 
 
@@ -31,10 +32,11 @@ use embassy_rp::pwm::{Pwm, Config as PwmConfig};
 use embassy_time::Delay;
 use embassy_time::Timer;
 use embassy_time::Instant;
+use embassy_time::Duration;
 
 // LCD
 use embassy_rp::i2c::{I2c, Config as I2cConfig, InterruptHandler as I2cInterruptHandler};
-use embassy_rp::peripherals::{I2C1, PIN_0, PIN_1, PIN_2, PWM_CH1};
+use embassy_rp::peripherals::{I2C1, PIN_0, PIN_1, PIN_2, PIN_5, PIN_6, PWM_CH1};
 use ag_lcd::{Cursor, LcdDisplay};
 use port_expander::dev::pcf8574::Pcf8574;
 use panic_halt as _;
@@ -57,13 +59,19 @@ enum Direction {
   Backward
 }
 
+enum Button {
+  StopButton,
+  SubmitButton,
+}
+
 
 const DISPLAY_FREQ: u32 = 200_000;
 const TOP: u16 = 0x8000;
-const PANIC_DISTANCE: u32 = 10;
+const PANIC_DISTANCE: u32 = 70;
 
 static MOTION_CHANNEL: Channel<ThreadModeRawMutex, Motion, 64> = Channel::new();
 static DISTANCE_CHANNEL: Channel<ThreadModeRawMutex, u32, 64> = Channel::new();
+static BUTTON_CHANNEL: Channel<ThreadModeRawMutex, Button, 64> = Channel::new();
 
 // The task used by the serial port driver over USB
 #[embassy_executor::task]
@@ -74,7 +82,7 @@ async fn logger_task(driver: Driver<'static, USB>) {
 #[embassy_executor::task]
 async fn detect_motion(motion_sensor: Input<'static, PIN_0>, channel_sender: Sender<'static, ThreadModeRawMutex, Motion, 64>) {
   loop {
-    match  motion_sensor.is_high() {
+    match motion_sensor.is_high() {
         true => {
           channel_sender.send(Motion::MotionDetected).await;
         }
@@ -138,6 +146,22 @@ async fn servomotor(mut direction: Direction, mut servo: Pwm<'static, PWM_CH1>, 
   }
 }
 
+#[embassy_executor::task]
+async fn buttons(mut stop_button: Input<'static, PIN_5>, mut submit_button: Input<'static, PIN_6>, channel_sender: Sender<'static, ThreadModeRawMutex, Button, 64>) {
+  loop {
+    let select_button = select(stop_button.wait_for_falling_edge(), submit_button.wait_for_falling_edge()).await;
+  
+    match select_button {
+        First(_) => {
+          channel_sender.send(Button::StopButton).await;
+        },
+        Second(_) => {
+          channel_sender.send(Button::SubmitButton).await;
+        }
+    }
+  }
+}
+
 
 
 
@@ -179,32 +203,62 @@ async fn main(spawner: Spawner) {
     let mut trigger = Output::new(peripherals.PIN_1, Level::Low);
     let mut echo =  Input::new(peripherals.PIN_2, Pull::None);
     spawner.spawn(calculate_distance(trigger, echo, DISTANCE_CHANNEL.sender())).unwrap();
-
+    
     // servomotor
     let mut servo_config: PwmConfig = Default::default();
     servo_config.top = TOP;
-    servo_config.compare_b = 0;
-
+    servo_config.compare_b = 0; 
     let mut servo = Pwm::new_output_b(peripherals.PWM_CH1, peripherals.PIN_3, servo_config.clone());
     spawner.spawn(servomotor(Direction::Forward, servo, servo_config)).unwrap();
+    
+    // stop/submit button
+    let mut stop_button = Input::new(peripherals.PIN_5, Pull::Up);
+    let mut submit_button = Input::new(peripherals.PIN_6, Pull::Up);
+    spawner.spawn(buttons(stop_button, submit_button, BUTTON_CHANNEL.sender())).unwrap();
 
     // buzzer
     let mut buzzer_config: PwmConfig = Default::default();
     buzzer_config.top = TOP;
     buzzer_config.compare_a = 0;
-
     let mut buzzer = Pwm::new_output_a(peripherals.PWM_CH2, peripherals.PIN_4, buzzer_config.clone());
 
-    
+
     loop {
       let (motion, distance) = join(MOTION_CHANNEL.receive(), DISTANCE_CHANNEL.receive()).await;
 
       if motion == Motion::MotionDetected && distance <= PANIC_DISTANCE {
         // start buzzer
-        buzzer_config.compare_a = buzzer_config.top / 2;
+        buzzer_config.compare_a = buzzer_config.top / 10;
         buzzer.set_config(&buzzer_config);
-      }
 
+
+        // the buzzer will stop if the correct code is introduced or if the timer expires
+        let button_or_timeout = select(BUTTON_CHANNEL.receive(), Timer::after_secs(10)).await;
+        match button_or_timeout {
+          First(button) => {
+            match button {
+                  Button::StopButton => {
+                    buzzer_config.compare_a = 0;
+                    buzzer.set_config(&buzzer_config);
+                  }
+                  Button::SubmitButton => {
+                      // #TODO
+                      // get code from keypad
+                      // display code on lcd
+                      // check if code is correct
+                      // stop buzzer if code is correct
+                  }
+            }
+          }
+          Second(_) => {
+            buzzer_config.compare_a = 0;
+            buzzer.set_config(&buzzer_config);
+          }  
+        }
+      
+      }
+  
+      Timer::after_secs(10).await;
 
     }
 }
