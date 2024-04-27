@@ -186,7 +186,7 @@ async fn keypad(column_1: &mut Output<'static, PIN_19>,
                 row_3: &mut Input<'static, PIN_21>,
                 row_4: &mut Input<'static, PIN_20>) -> String<8> {
 
-  let mut keypad_data: String<8> = String::try_from(" ").unwrap();     
+  let mut keypad_code: String<8> = String::try_from(" ").unwrap();     
   for column_index in 1..=4 {
     match column_index {
       1 => column_1.set_high(),
@@ -207,22 +207,22 @@ async fn keypad(column_1: &mut Output<'static, PIN_19>,
         match button_pressed {
           First4(_) => {
             let button = map_button(column_index - 1, 0 as usize);
-            keypad_data.push_str(&button).unwrap();
+            keypad_code.push_str(&button).unwrap();
             info!("row1, button: {}", button);
           }
           Second4(_) => {
             let button = map_button(column_index - 1,1 as usize);
-            keypad_data.push_str(&button).unwrap();
+            keypad_code.push_str(&button).unwrap();
             info!("row2, button: {}", button);
           }
           Third4(_) => {
             let button = map_button(column_index - 1, 2 as usize);
-            keypad_data.push_str(&button).unwrap();
+            keypad_code.push_str(&button).unwrap();
             info!("row3, button: {}", button);
           }
           Fourth4(_) => {
             let button = map_button(column_index - 1, 3 as usize);
-            keypad_data.push_str(&button).unwrap();
+            keypad_code.push_str(&button).unwrap();
             info!("row4, button: {}", button);
           }
         }
@@ -235,7 +235,7 @@ async fn keypad(column_1: &mut Output<'static, PIN_19>,
           _ => unreachable!(),
         }
     }
-    return keypad_data;
+    return keypad_code;
     
 }
 
@@ -330,12 +330,27 @@ async fn main(spawner: Spawner) {
                     buzzer.set_config(&buzzer_config);
                   }
                   Button::SubmitButton => {
-                      // #TODO
+                      lcd.clear();
+                      lcd.print("Enter code: ");
+
                       // get code from keypad
-                      // display code on lcd
+                      let code = keypad(&mut column_1, &mut column_2, &mut column_3, &mut column_4, &mut row_1, &mut row_2, &mut row_3, &mut row_4).await;
+                     
+                      // display code on lcd and wait 3 seconds before checking the code
+                      lcd.print(&code);
+                      Timer::after_secs(3).await;
+
                       // check if code is correct
                       // stop buzzer if code is correct
-                      keypad(&mut column_1, &mut column_2, &mut column_3, &mut column_4, &mut row_1, &mut row_2, &mut row_3, &mut row_4).await;
+                      if unsafe { TEST_PASSWORD.as_bytes() == code.as_bytes() } {
+                        buzzer_config.compare_a = 0;
+                        buzzer.set_config(&buzzer_config);
+                        lcd.clear();
+                        lcd.print("Correct code");
+                      } else {
+                        lcd.clear();
+                        lcd.print("Incorrect code");
+                      }
                   }
             }
           }
