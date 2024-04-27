@@ -4,8 +4,11 @@
 #![allow(unused_imports)]
 #![allow(unused_mut)]
 
+
 use embassy_executor::Spawner;
 use embassy_rp::config;
+
+use heapless::String;
 
 // USB driver
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
@@ -181,8 +184,9 @@ async fn keypad(column_1: &mut Output<'static, PIN_19>,
                 row_1: &mut Input<'static, PIN_26>,
                 row_2: &mut Input<'static, PIN_22>,
                 row_3: &mut Input<'static, PIN_21>,
-                row_4: &mut Input<'static, PIN_20>) {
+                row_4: &mut Input<'static, PIN_20>) -> String<8> {
 
+  let mut keypad_data: String<8> = String::try_from(" ").unwrap();     
   for column_index in 1..=4 {
     match column_index {
       1 => column_1.set_high(),
@@ -203,18 +207,22 @@ async fn keypad(column_1: &mut Output<'static, PIN_19>,
         match button_pressed {
           First4(_) => {
             let button = map_button(column_index - 1, 0 as usize);
+            keypad_data.push_str(&button).unwrap();
             info!("row1, button: {}", button);
           }
           Second4(_) => {
             let button = map_button(column_index - 1,1 as usize);
+            keypad_data.push_str(&button).unwrap();
             info!("row2, button: {}", button);
           }
           Third4(_) => {
             let button = map_button(column_index - 1, 2 as usize);
+            keypad_data.push_str(&button).unwrap();
             info!("row3, button: {}", button);
           }
           Fourth4(_) => {
             let button = map_button(column_index - 1, 3 as usize);
+            keypad_data.push_str(&button).unwrap();
             info!("row4, button: {}", button);
           }
         }
@@ -227,6 +235,8 @@ async fn keypad(column_1: &mut Output<'static, PIN_19>,
           _ => unreachable!(),
         }
     }
+    return keypad_data;
+    
 }
 
 
