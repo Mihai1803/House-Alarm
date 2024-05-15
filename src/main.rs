@@ -9,6 +9,8 @@ use embassy_executor::Spawner;
 use embassy_rp::config;
 
 use heapless::String;
+use fixed::types::extra::U4;
+use fixed::FixedU16;
 
 // USB driver
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
@@ -69,10 +71,11 @@ enum Button {
 
 
 const DISPLAY_FREQ: u32 = 200_000;
-const TOP: u16 = 0x8000;
+const TOP_BUZZER: u16 = 0x8000;
+const TOP_SERVO: u16 = 2500;
 const PANIC_DISTANCE: u32 = 70;
 
-static mut TEST_PASSWORD: &'static str = "1234";
+static mut TEST_PASSWORD: &'static str = "123A";
 
 static MOTION_CHANNEL: Channel<ThreadModeRawMutex, Motion, 64> = Channel::new();
 static DISTANCE_CHANNEL: Channel<ThreadModeRawMutex, u32, 64> = Channel::new();
@@ -130,21 +133,29 @@ async fn calculate_distance(mut trigger: Output<'static, PIN_1>, mut echo: Input
 
 #[embassy_executor::task]
 async fn servomotor(mut direction: Direction, mut servo: Pwm<'static, PWM_CH1>, mut config: PwmConfig) {
+  let mut count = 0;
   loop {
+      count += 1;
       match direction {
           Direction::Forward => {
-            if config.compare_b + config.top == config.top {
+            if count == 9 {
+              count = 0;
               direction = Direction::Backward;
+            } else {
+              config.compare_b += config.top / 10;
+              servo.set_config(&config);
+              Timer::after_secs(1).await;
             }
-            config.compare_b += config.top / 10;
-            servo.set_config(&config);
           }
           Direction::Backward => {
-            if config.compare_b - config.top == 0 {
+            if count == 9 {
+              count = 0;
               direction = Direction::Forward;
+            } else {
+              config.compare_b -= config.top / 10;
+              servo.set_config(&config);
+              Timer::after_secs(1).await;
             }
-            config.compare_b -= config.top / 10;
-            servo.set_config(&config);
           }
       }
       Timer::after_secs(1).await;
@@ -186,7 +197,7 @@ async fn keypad(column_1: &mut Output<'static, PIN_19>,
                 row_3: &mut Input<'static, PIN_21>,
                 row_4: &mut Input<'static, PIN_20>) -> String<8> {
 
-  let mut keypad_code: String<8> = String::try_from(" ").unwrap();     
+  let mut keypad_code: String<8> = String::try_from("").unwrap();     
   for column_index in 1..=4 {
     match column_index {
       1 => column_1.set_high(),
@@ -266,10 +277,7 @@ async fn main(spawner: Spawner) {
     .with_cursor(Cursor::Off)
     .with_reliable_init(10000)
     .build();
-
-    // Write to LCD
-    lcd.print("Hello World");
-
+ 
     // motion sensor
     let motion_sensor = Input::new(peripherals.PIN_0, Pull::Up);
     spawner.spawn(detect_motion(motion_sensor, MOTION_CHANNEL.sender())).unwrap();
@@ -281,14 +289,15 @@ async fn main(spawner: Spawner) {
     
     // servomotor
     let mut servo_config: PwmConfig = Default::default();
-    servo_config.top = TOP;
-    servo_config.compare_b = 0; 
+    servo_config.top = TOP_SERVO;
+    servo_config.divider = FixedU16::<U4>::from_num(125);
+    servo_config.compare_b = servo_config.top - 1; 
     let mut servo = Pwm::new_output_b(peripherals.PWM_CH1, peripherals.PIN_3, servo_config.clone());
-    spawner.spawn(servomotor(Direction::Forward, servo, servo_config)).unwrap();
+    spawner.spawn(servomotor(Direction::Backward, servo, servo_config)).unwrap();
     
     // buzzer
     let mut buzzer_config: PwmConfig = Default::default();
-    buzzer_config.top = TOP;
+    buzzer_config.top = TOP_BUZZER;
     buzzer_config.compare_a = 0;
     let mut buzzer = Pwm::new_output_a(peripherals.PWM_CH2, peripherals.PIN_4, buzzer_config.clone());
     
@@ -309,9 +318,9 @@ async fn main(spawner: Spawner) {
     let mut row_1 = Input::new(peripherals.PIN_26, Pull::Down);
 
     
-
-
+    lcd.print("Checking...");
     loop {
+  
       let (motion, distance) = join(MOTION_CHANNEL.receive(), DISTANCE_CHANNEL.receive()).await;
 
       if motion == Motion::MotionDetected && distance <= PANIC_DISTANCE {
@@ -328,10 +337,13 @@ async fn main(spawner: Spawner) {
                   Button::StopButton => {
                     buzzer_config.compare_a = 0;
                     buzzer.set_config(&buzzer_config);
+                    lcd.clear();
+                    lcd.print("Alarm Stopped");
+                    
                   }
                   Button::SubmitButton => {
                       lcd.clear();
-                      lcd.print("Enter code: ");
+                      lcd.print("Enter code:");
 
                       // get code from keypad
                       let code = keypad(&mut column_1, &mut column_2, &mut column_3, &mut column_4, &mut row_1, &mut row_2, &mut row_3, &mut row_4).await;
@@ -340,6 +352,7 @@ async fn main(spawner: Spawner) {
                       lcd.print(&code);
                       Timer::after_secs(3).await;
 
+                      info!("Code:{}", code);
                       // check if code is correct
                       // stop buzzer if code is correct
                       if unsafe { TEST_PASSWORD.as_bytes() == code.as_bytes() } {
@@ -361,8 +374,10 @@ async fn main(spawner: Spawner) {
         }
       
       }
-  
-      Timer::after_secs(10).await;
+      Timer::after_secs(5).await;
+      lcd.clear();
+      lcd.print("Checking...");
+      Timer::after_secs(5).await;
 
     }
 }
