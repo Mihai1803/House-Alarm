@@ -27,9 +27,7 @@ use embassy_futures::select::{select, select4, Select};
 use embassy_futures::select::Either::{First as First2, Second as Second2};
 use embassy_futures::select::Either4::{First as First4, Second as Second4, Third as Third4, Fourth as Fourth4};
 
-
-
-// GPIO
+// GPIO / PWM
 use embassy_rp::gpio::{Input, Pull, Output, Level};
 use embassy_rp::pwm::{Pwm, Config as PwmConfig};
 
@@ -41,10 +39,23 @@ use embassy_time::Duration;
 
 // LCD
 use embassy_rp::i2c::{I2c, Config as I2cConfig, InterruptHandler as I2cInterruptHandler};
-use embassy_rp::peripherals::{I2C1, PIN_0, PIN_1, PIN_2, PIN_5, PIN_6, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_21, PIN_22, PIN_26, PWM_CH1};
+use embassy_rp::peripherals::{I2C1, PIN_1, PIN_2, PIN_5, PIN_6, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_21, PIN_22, PIN_26, PIN_27, PWM_CH1};
 use ag_lcd::{Cursor, LcdDisplay};
 use port_expander::dev::pcf8574::Pcf8574;
 use panic_halt as _;
+
+// MicroSD
+use core::cell::RefCell;
+use embassy_rp::spi::{Spi, Config as SpiConfig};
+use embassy_sync::blocking_mutex::NoopMutex;
+use embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice;
+
+use embedded_sdmmc::{SdCard, VolumeManager, Mode, VolumeIdx};
+use embedded_sdmmc::TimeSource;
+use embedded_sdmmc::Timestamp;
+
+
+
 
 
 bind_interrupts!(struct Irqs {
@@ -69,13 +80,27 @@ enum Button {
   SubmitButton,
 }
 
+#[derive(Default)]
+struct Time();
+impl TimeSource for Time {
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp {
+          year_since_1970: 0,
+          zero_indexed_month: 0,
+          zero_indexed_day: 0,
+          hours: 0,
+          minutes: 0,
+          seconds: 0,
+        }
+    }
+}
 
 const DISPLAY_FREQ: u32 = 200_000;
 const TOP_BUZZER: u16 = 0x8000;
 const TOP_SERVO: u16 = 2500;
 const PANIC_DISTANCE: u32 = 70;
 
-static mut TEST_PASSWORD: &'static str = "123A";
+//static mut TEST_PASSWORD: &'static str = "123A";
 
 static MOTION_CHANNEL: Channel<ThreadModeRawMutex, Motion, 64> = Channel::new();
 static DISTANCE_CHANNEL: Channel<ThreadModeRawMutex, u32, 64> = Channel::new();
@@ -88,7 +113,7 @@ async fn logger_task(driver: Driver<'static, USB>) {
 }
 
 #[embassy_executor::task]
-async fn detect_motion(motion_sensor: Input<'static, PIN_0>, channel_sender: Sender<'static, ThreadModeRawMutex, Motion, 64>) {
+async fn detect_motion(motion_sensor: Input<'static, PIN_27>, channel_sender: Sender<'static, ThreadModeRawMutex, Motion, 64>) {
   loop {
     match motion_sensor.is_high() {
         true => {
@@ -265,7 +290,7 @@ async fn main(spawner: Spawner) {
     let sda = peripherals.PIN_14;
     let scl = peripherals.PIN_15;
 
-    let delay = Delay;
+    let lcd_delay = Delay;
 
     let mut lcd_config = I2cConfig::default();
     lcd_config.frequency = DISPLAY_FREQ;
@@ -273,13 +298,13 @@ async fn main(spawner: Spawner) {
     let i2c = I2c::new_async(peripherals.I2C1, scl, sda, Irqs, lcd_config.clone());
     let mut i2c_expander = Pcf8574::new(i2c, true, true, true);
 
-    let mut lcd: LcdDisplay<_, _> = LcdDisplay::new_pcf8574(&mut i2c_expander, delay)
+    let mut lcd: LcdDisplay<_, _> = LcdDisplay::new_pcf8574(&mut i2c_expander, lcd_delay)
     .with_cursor(Cursor::Off)
     .with_reliable_init(10000)
     .build();
  
     // motion sensor
-    let motion_sensor = Input::new(peripherals.PIN_0, Pull::Up);
+    let motion_sensor = Input::new(peripherals.PIN_27, Pull::Up); 
     spawner.spawn(detect_motion(motion_sensor, MOTION_CHANNEL.sender())).unwrap();
 
     // distance sensor
@@ -317,12 +342,70 @@ async fn main(spawner: Spawner) {
     let mut row_2 = Input::new(peripherals.PIN_22, Pull::Down);
     let mut row_1 = Input::new(peripherals.PIN_26, Pull::Down);
 
+
+    // microSD
+    let mut micro_sd_cs = Output::new(peripherals.PIN_9, Level::High);
+    let mut clk = peripherals.PIN_10;
+    let mut mosi = peripherals.PIN_11;
+    let mut miso = peripherals.PIN_12;
+      
+    let mut micro_sd_delay = Delay;
+    let mut micro_sd_config = SpiConfig::default();
+    micro_sd_config.frequency = 400000;
+
+    let mut spi = Spi::new_blocking(peripherals.SPI1, clk, mosi, miso, micro_sd_config.clone());
+    let spi_bus = NoopMutex::new(RefCell::new(spi));
+    let spi_device = SpiDevice::new(&spi_bus, micro_sd_cs);
+
+    let mut dummy_cs = Output::new(peripherals.PIN_8, Level::High);
+    let mut sdcard = SdCard::new(spi_device, dummy_cs, micro_sd_delay);
+    let mut time_source = Time::default();
+
+    Timer::after_millis(100).await;
+
+    let mut volume_mgr = VolumeManager::new(sdcard, time_source);
+
+    
+    let mut volume0 = match volume_mgr.get_volume(VolumeIdx(0)) {
+      Ok(volume) => volume, 
+      Err(err) => {
+        info!("Error opening volume: {:?}", err);
+        return;
+      }
+    };
+
+    Timer::after_millis(100).await;
+  
+    let mut root_dir = match volume_mgr.open_root_dir(&volume0) {
+        Ok(root) => root,
+        Err(err) => {
+          info!("Error opening root directory: {:?}", err);
+          return;
+        }
+    };
+
+    Timer::after_millis(100).await;
+
+    volume_mgr
+    .iterate_dir(&volume0, &root_dir, |ent| {
+        info!(
+            "/{}.{}",
+            core::str::from_utf8(ent.name.base_name()).unwrap(),
+            core::str::from_utf8(ent.name.extension()).unwrap()
+        );
+    })
+    .unwrap();
+
+    Timer::after_millis(100).await;
+
+
     
     lcd.print("Checking...");
     loop {
   
       let (motion, distance) = join(MOTION_CHANNEL.receive(), DISTANCE_CHANNEL.receive()).await;
 
+      info!("Distance {}", distance);
       if motion == Motion::MotionDetected && distance <= PANIC_DISTANCE {
         // start buzzer
         buzzer_config.compare_a = buzzer_config.top / 10;
@@ -353,9 +436,33 @@ async fn main(spawner: Spawner) {
                       Timer::after_secs(3).await;
 
                       info!("Code:{}", code);
+
+                      // read password from microSD
+                      let mut successful_read = false;
+                      let mut password: String<8> = String::try_from("").unwrap();
+                      if let Ok(mut file) = volume_mgr.open_file_in_dir(&mut volume0, &root_dir, "password.txt", Mode::ReadOnly) {
+                        let mut buf = [0u8; 32];
+                        let read_count = volume_mgr.read(&volume0, &mut file, &mut buf).unwrap();
+                        volume_mgr.close_file(&volume0, file).unwrap();
+                  
+                        if read_count >= 2 {
+                            for iterator in 0..read_count {
+                              info!("bytes: {:?}", buf[iterator] as char);
+                              password.push(buf[iterator] as char).unwrap();
+                            }
+                            info!("password: {:?}", password);
+                            successful_read = true;
+                        }
+                      }
+                      if successful_read {
+                        info!("Success");
+                      } else {
+                        info!("Could not read from microSD");
+                      }
+
                       // check if code is correct
                       // stop buzzer if code is correct
-                      if unsafe { TEST_PASSWORD.as_bytes() == code.as_bytes() } {
+                      if password.as_bytes() == code.as_bytes() {
                         buzzer_config.compare_a = 0;
                         buzzer.set_config(&buzzer_config);
                         lcd.clear();
