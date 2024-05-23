@@ -9,6 +9,8 @@ use embassy_executor::Spawner;
 use embassy_rp::config;
 
 use heapless::String;
+use fixed::types::extra::U4;
+use fixed::FixedU16;
 
 // USB driver
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
@@ -25,9 +27,7 @@ use embassy_futures::select::{select, select4, Select};
 use embassy_futures::select::Either::{First as First2, Second as Second2};
 use embassy_futures::select::Either4::{First as First4, Second as Second4, Third as Third4, Fourth as Fourth4};
 
-
-
-// GPIO
+// GPIO / PWM
 use embassy_rp::gpio::{Input, Pull, Output, Level};
 use embassy_rp::pwm::{Pwm, Config as PwmConfig};
 
@@ -39,10 +39,23 @@ use embassy_time::Duration;
 
 // LCD
 use embassy_rp::i2c::{I2c, Config as I2cConfig, InterruptHandler as I2cInterruptHandler};
-use embassy_rp::peripherals::{I2C1, PIN_0, PIN_1, PIN_2, PIN_5, PIN_6, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_21, PIN_22, PIN_26, PWM_CH1};
+use embassy_rp::peripherals::{I2C1, PIN_1, PIN_2, PIN_5, PIN_6, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_21, PIN_22, PIN_26, PIN_27, PWM_CH1};
 use ag_lcd::{Cursor, LcdDisplay};
 use port_expander::dev::pcf8574::Pcf8574;
 use panic_halt as _;
+
+// MicroSD
+use core::cell::RefCell;
+use embassy_rp::spi::{Spi, Config as SpiConfig};
+use embassy_sync::blocking_mutex::NoopMutex;
+use embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice;
+
+use embedded_sdmmc::{SdCard, VolumeManager, Mode, VolumeIdx};
+use embedded_sdmmc::TimeSource;
+use embedded_sdmmc::Timestamp;
+
+
+
 
 
 bind_interrupts!(struct Irqs {
@@ -67,12 +80,27 @@ enum Button {
   SubmitButton,
 }
 
+#[derive(Default)]
+struct Time();
+impl TimeSource for Time {
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp {
+          year_since_1970: 0,
+          zero_indexed_month: 0,
+          zero_indexed_day: 0,
+          hours: 0,
+          minutes: 0,
+          seconds: 0,
+        }
+    }
+}
 
 const DISPLAY_FREQ: u32 = 200_000;
-const TOP: u16 = 0x8000;
+const TOP_BUZZER: u16 = 0x8000;
+const TOP_SERVO: u16 = 2500;
 const PANIC_DISTANCE: u32 = 70;
 
-static mut TEST_PASSWORD: &'static str = "1234";
+//static mut TEST_PASSWORD: &'static str = "123A";
 
 static MOTION_CHANNEL: Channel<ThreadModeRawMutex, Motion, 64> = Channel::new();
 static DISTANCE_CHANNEL: Channel<ThreadModeRawMutex, u32, 64> = Channel::new();
@@ -85,7 +113,7 @@ async fn logger_task(driver: Driver<'static, USB>) {
 }
 
 #[embassy_executor::task]
-async fn detect_motion(motion_sensor: Input<'static, PIN_0>, channel_sender: Sender<'static, ThreadModeRawMutex, Motion, 64>) {
+async fn detect_motion(motion_sensor: Input<'static, PIN_27>, channel_sender: Sender<'static, ThreadModeRawMutex, Motion, 64>) {
   loop {
     match motion_sensor.is_high() {
         true => {
@@ -130,21 +158,29 @@ async fn calculate_distance(mut trigger: Output<'static, PIN_1>, mut echo: Input
 
 #[embassy_executor::task]
 async fn servomotor(mut direction: Direction, mut servo: Pwm<'static, PWM_CH1>, mut config: PwmConfig) {
+  let mut count = 0;
   loop {
+      count += 1;
       match direction {
           Direction::Forward => {
-            if config.compare_b + config.top == config.top {
+            if count == 9 {
+              count = 0;
               direction = Direction::Backward;
+            } else {
+              config.compare_b += config.top / 10;
+              servo.set_config(&config);
+              Timer::after_secs(1).await;
             }
-            config.compare_b += config.top / 10;
-            servo.set_config(&config);
           }
           Direction::Backward => {
-            if config.compare_b - config.top == 0 {
+            if count == 9 {
+              count = 0;
               direction = Direction::Forward;
+            } else {
+              config.compare_b -= config.top / 10;
+              servo.set_config(&config);
+              Timer::after_secs(1).await;
             }
-            config.compare_b -= config.top / 10;
-            servo.set_config(&config);
           }
       }
       Timer::after_secs(1).await;
@@ -186,7 +222,7 @@ async fn keypad(column_1: &mut Output<'static, PIN_19>,
                 row_3: &mut Input<'static, PIN_21>,
                 row_4: &mut Input<'static, PIN_20>) -> String<8> {
 
-  let mut keypad_code: String<8> = String::try_from(" ").unwrap();     
+  let mut keypad_code: String<8> = String::try_from("").unwrap();     
   for column_index in 1..=4 {
     match column_index {
       1 => column_1.set_high(),
@@ -254,7 +290,7 @@ async fn main(spawner: Spawner) {
     let sda = peripherals.PIN_14;
     let scl = peripherals.PIN_15;
 
-    let delay = Delay;
+    let lcd_delay = Delay;
 
     let mut lcd_config = I2cConfig::default();
     lcd_config.frequency = DISPLAY_FREQ;
@@ -262,16 +298,13 @@ async fn main(spawner: Spawner) {
     let i2c = I2c::new_async(peripherals.I2C1, scl, sda, Irqs, lcd_config.clone());
     let mut i2c_expander = Pcf8574::new(i2c, true, true, true);
 
-    let mut lcd: LcdDisplay<_, _> = LcdDisplay::new_pcf8574(&mut i2c_expander, delay)
+    let mut lcd: LcdDisplay<_, _> = LcdDisplay::new_pcf8574(&mut i2c_expander, lcd_delay)
     .with_cursor(Cursor::Off)
     .with_reliable_init(10000)
     .build();
-
-    // Write to LCD
-    lcd.print("Hello World");
-
+ 
     // motion sensor
-    let motion_sensor = Input::new(peripherals.PIN_0, Pull::Up);
+    let motion_sensor = Input::new(peripherals.PIN_27, Pull::Up); 
     spawner.spawn(detect_motion(motion_sensor, MOTION_CHANNEL.sender())).unwrap();
 
     // distance sensor
@@ -281,14 +314,15 @@ async fn main(spawner: Spawner) {
     
     // servomotor
     let mut servo_config: PwmConfig = Default::default();
-    servo_config.top = TOP;
-    servo_config.compare_b = 0; 
+    servo_config.top = TOP_SERVO;
+    servo_config.divider = FixedU16::<U4>::from_num(125);
+    servo_config.compare_b = servo_config.top - 1; 
     let mut servo = Pwm::new_output_b(peripherals.PWM_CH1, peripherals.PIN_3, servo_config.clone());
-    spawner.spawn(servomotor(Direction::Forward, servo, servo_config)).unwrap();
+    spawner.spawn(servomotor(Direction::Backward, servo, servo_config)).unwrap();
     
     // buzzer
     let mut buzzer_config: PwmConfig = Default::default();
-    buzzer_config.top = TOP;
+    buzzer_config.top = TOP_BUZZER;
     buzzer_config.compare_a = 0;
     let mut buzzer = Pwm::new_output_a(peripherals.PWM_CH2, peripherals.PIN_4, buzzer_config.clone());
     
@@ -308,11 +342,70 @@ async fn main(spawner: Spawner) {
     let mut row_2 = Input::new(peripherals.PIN_22, Pull::Down);
     let mut row_1 = Input::new(peripherals.PIN_26, Pull::Down);
 
-    
 
+    // microSD
+    let mut micro_sd_cs = Output::new(peripherals.PIN_9, Level::High);
+    let mut clk = peripherals.PIN_10;
+    let mut mosi = peripherals.PIN_11;
+    let mut miso = peripherals.PIN_12;
+      
+    let mut micro_sd_delay = Delay;
+    let mut micro_sd_config = SpiConfig::default();
+    micro_sd_config.frequency = 400000;
+
+    let mut spi = Spi::new_blocking(peripherals.SPI1, clk, mosi, miso, micro_sd_config.clone());
+    let spi_bus = NoopMutex::new(RefCell::new(spi));
+    let spi_device = SpiDevice::new(&spi_bus, micro_sd_cs);
+
+    let mut dummy_cs = Output::new(peripherals.PIN_8, Level::High);
+    let mut sdcard = SdCard::new(spi_device, dummy_cs, micro_sd_delay);
+    let mut time_source = Time::default();
+
+    Timer::after_millis(100).await;
+
+    let mut volume_mgr = VolumeManager::new(sdcard, time_source);
+
+    
+    let mut volume0 = match volume_mgr.get_volume(VolumeIdx(0)) {
+      Ok(volume) => volume, 
+      Err(err) => {
+        info!("Error opening volume: {:?}", err);
+        return;
+      }
+    };
+
+    Timer::after_millis(100).await;
+  
+    let mut root_dir = match volume_mgr.open_root_dir(&volume0) {
+        Ok(root) => root,
+        Err(err) => {
+          info!("Error opening root directory: {:?}", err);
+          return;
+        }
+    };
+
+    Timer::after_millis(100).await;
+
+    volume_mgr
+    .iterate_dir(&volume0, &root_dir, |ent| {
+        info!(
+            "/{}.{}",
+            core::str::from_utf8(ent.name.base_name()).unwrap(),
+            core::str::from_utf8(ent.name.extension()).unwrap()
+        );
+    })
+    .unwrap();
+
+    Timer::after_millis(100).await;
+
+
+    
+    lcd.print("Checking...");
     loop {
+  
       let (motion, distance) = join(MOTION_CHANNEL.receive(), DISTANCE_CHANNEL.receive()).await;
 
+      info!("Distance {}", distance);
       if motion == Motion::MotionDetected && distance <= PANIC_DISTANCE {
         // start buzzer
         buzzer_config.compare_a = buzzer_config.top / 10;
@@ -327,10 +420,13 @@ async fn main(spawner: Spawner) {
                   Button::StopButton => {
                     buzzer_config.compare_a = 0;
                     buzzer.set_config(&buzzer_config);
+                    lcd.clear();
+                    lcd.print("Alarm Stopped");
+                    
                   }
                   Button::SubmitButton => {
                       lcd.clear();
-                      lcd.print("Enter code: ");
+                      lcd.print("Enter code:");
 
                       // get code from keypad
                       let code = keypad(&mut column_1, &mut column_2, &mut column_3, &mut column_4, &mut row_1, &mut row_2, &mut row_3, &mut row_4).await;
@@ -339,9 +435,34 @@ async fn main(spawner: Spawner) {
                       lcd.print(&code);
                       Timer::after_secs(3).await;
 
+                      info!("Code:{}", code);
+
+                      // read password from microSD
+                      let mut successful_read = false;
+                      let mut password: String<8> = String::try_from("").unwrap();
+                      if let Ok(mut file) = volume_mgr.open_file_in_dir(&mut volume0, &root_dir, "password.txt", Mode::ReadOnly) {
+                        let mut buf = [0u8; 32];
+                        let read_count = volume_mgr.read(&volume0, &mut file, &mut buf).unwrap();
+                        volume_mgr.close_file(&volume0, file).unwrap();
+                  
+                        if read_count >= 2 {
+                            for iterator in 0..read_count {
+                              info!("bytes: {:?}", buf[iterator] as char);
+                              password.push(buf[iterator] as char).unwrap();
+                            }
+                            info!("password: {:?}", password);
+                            successful_read = true;
+                        }
+                      }
+                      if successful_read {
+                        info!("Success");
+                      } else {
+                        info!("Could not read from microSD");
+                      }
+
                       // check if code is correct
                       // stop buzzer if code is correct
-                      if unsafe { TEST_PASSWORD.as_bytes() == code.as_bytes() } {
+                      if password.as_bytes() == code.as_bytes() {
                         buzzer_config.compare_a = 0;
                         buzzer.set_config(&buzzer_config);
                         lcd.clear();
@@ -360,8 +481,10 @@ async fn main(spawner: Spawner) {
         }
       
       }
-  
-      Timer::after_secs(10).await;
+      Timer::after_secs(5).await;
+      lcd.clear();
+      lcd.print("Checking...");
+      Timer::after_secs(5).await;
 
     }
 }
