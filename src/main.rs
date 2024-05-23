@@ -310,7 +310,6 @@ async fn main(spawner: Spawner) {
 
     
 
-
     loop {
       let (motion, distance) = join(MOTION_CHANNEL.receive(), DISTANCE_CHANNEL.receive()).await;
 
