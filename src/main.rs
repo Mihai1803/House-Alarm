@@ -123,7 +123,8 @@ async fn detect_motion(motion_sensor: Input<'static, PIN_27>, channel_sender: Se
           channel_sender.send(Motion::MotionNotDetected).await;
         }
     }
-    Timer::after_secs(10).await;
+    Timer::after_micros(10).await;
+    Timer::after_secs(5).await;
   }
 }
 
@@ -152,7 +153,7 @@ async fn calculate_distance(mut trigger: Output<'static, PIN_1>, mut echo: Input
 
     channel_sender.send(distance).await;
 
-    Timer::after_secs(1).await;
+    Timer::after_secs(5).await;
   }
 }
 
