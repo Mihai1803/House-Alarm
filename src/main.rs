@@ -399,8 +399,6 @@ async fn main(spawner: Spawner) {
 
     Timer::after_millis(100).await;
 
-
-    
     lcd.print("Checking...");
     loop {
   
@@ -412,6 +410,18 @@ async fn main(spawner: Spawner) {
         buzzer_config.compare_a = buzzer_config.top / 10;
         buzzer.set_config(&buzzer_config);
 
+        let mut successful_write = false;
+        if let Ok(mut file) = volume_mgr.open_file_in_dir(&mut volume0, &root_dir, "data.txt", Mode::ReadWriteAppend) {
+          let _write_count = volume_mgr.write(&mut volume0, &mut file, b"alarm trigger").unwrap();
+          volume_mgr.close_file(&volume0, file).unwrap();
+          successful_write = true;
+        }
+
+        if successful_write {
+          info!("Success writing to the microSD");
+        } else {
+          info!("Could not write to the microSD");
+        }
 
         // the buzzer will stop if the correct code is introduced or if the timer expires
         let button_or_timeout = select(BUTTON_CHANNEL.receive(), Timer::after_secs(10)).await;
@@ -455,8 +465,9 @@ async fn main(spawner: Spawner) {
                             successful_read = true;
                         }
                       }
+
                       if successful_read {
-                        info!("Success");
+                        info!("Success reading");
                       } else {
                         info!("Could not read from microSD");
                       }
