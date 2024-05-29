@@ -1,13 +1,12 @@
 #![no_std]
 #![no_main]
 
-#![allow(unused_imports)]
 #![allow(unused_mut)]
 
-
 use embassy_executor::Spawner;
-use embassy_rp::config;
 
+// Pheripherals and utilites
+use embassy_rp::peripherals::{I2C1, PIN_1, PIN_2, PIN_5, PIN_6, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_21, PIN_22, PIN_26, PIN_27, PWM_CH1};
 use heapless::String;
 use fixed::types::extra::U4;
 use fixed::FixedU16;
@@ -22,8 +21,8 @@ use embassy_sync::channel::{Channel, Sender};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 
 // Futures
-use embassy_futures::join::{join, Join};
-use embassy_futures::select::{select, select4, Select};
+use embassy_futures::join::join;
+use embassy_futures::select::{select, select4};
 use embassy_futures::select::Either::{First as First2, Second as Second2};
 use embassy_futures::select::Either4::{First as First4, Second as Second4, Third as Third4, Fourth as Fourth4};
 
@@ -35,34 +34,40 @@ use embassy_rp::pwm::{Pwm, Config as PwmConfig};
 use embassy_time::Delay;
 use embassy_time::Timer;
 use embassy_time::Instant;
-use embassy_time::Duration;
 
 // LCD
 use embassy_rp::i2c::{I2c, Config as I2cConfig, InterruptHandler as I2cInterruptHandler};
-use embassy_rp::peripherals::{I2C1, PIN_1, PIN_2, PIN_5, PIN_6, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_21, PIN_22, PIN_26, PIN_27, PWM_CH1};
 use ag_lcd::{Cursor, LcdDisplay};
 use port_expander::dev::pcf8574::Pcf8574;
 use panic_halt as _;
 
-// MicroSD
+// MicroSD bus
 use core::cell::RefCell;
 use embassy_rp::spi::{Spi, Config as SpiConfig};
 use embassy_sync::blocking_mutex::NoopMutex;
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice;
 
+// MicroSD
 use embedded_sdmmc::{SdCard, VolumeManager, Mode, VolumeIdx};
 use embedded_sdmmc::TimeSource;
 use embedded_sdmmc::Timestamp;
 
-
-
-
-
 bind_interrupts!(struct Irqs {
-    // Use for the serial over USB driver
-    USBCTRL_IRQ => UsbInterruptHandler<USB>;
-    I2C1_IRQ => I2cInterruptHandler<I2C1>;
+  // Use for the serial over USB driver
+  USBCTRL_IRQ => UsbInterruptHandler<USB>;
+  I2C1_IRQ => I2cInterruptHandler<I2C1>;
 });
+
+
+const DISPLAY_FREQ: u32 = 200_000;
+const TOP_BUZZER: u16 = 0x8000;
+const TOP_SERVO: u16 = 2500;
+const SOUND_VELOCITY: u32 = 340; 
+const PANIC_DISTANCE: u32 = 70;
+
+static MOTION_CHANNEL: Channel<ThreadModeRawMutex, Motion, 64> = Channel::new();
+static DISTANCE_CHANNEL: Channel<ThreadModeRawMutex, u32, 64> = Channel::new();
+static BUTTON_CHANNEL: Channel<ThreadModeRawMutex, Button, 64> = Channel::new();
 
 #[derive(PartialEq)]
 enum Motion {
@@ -95,16 +100,6 @@ impl TimeSource for Time {
     }
 }
 
-const DISPLAY_FREQ: u32 = 200_000;
-const TOP_BUZZER: u16 = 0x8000;
-const TOP_SERVO: u16 = 2500;
-const PANIC_DISTANCE: u32 = 70;
-
-//static mut TEST_PASSWORD: &'static str = "123A";
-
-static MOTION_CHANNEL: Channel<ThreadModeRawMutex, Motion, 64> = Channel::new();
-static DISTANCE_CHANNEL: Channel<ThreadModeRawMutex, u32, 64> = Channel::new();
-static BUTTON_CHANNEL: Channel<ThreadModeRawMutex, Button, 64> = Channel::new();
 
 // The task used by the serial port driver over USB
 #[embassy_executor::task]
@@ -112,6 +107,7 @@ async fn logger_task(driver: Driver<'static, USB>) {
     embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
 }
 
+// The task used to detect motion
 #[embassy_executor::task]
 async fn detect_motion(motion_sensor: Input<'static, PIN_27>, channel_sender: Sender<'static, ThreadModeRawMutex, Motion, 64>) {
   loop {
@@ -128,6 +124,8 @@ async fn detect_motion(motion_sensor: Input<'static, PIN_27>, channel_sender: Se
   }
 }
 
+
+// The task used to calculate the distance from an object to the sensor 
 #[embassy_executor::task]
 async fn calculate_distance(mut trigger: Output<'static, PIN_1>, mut echo: Input<'static, PIN_2>, channel_sender: Sender<'static, ThreadModeRawMutex, u32, 64>) {
   loop {
@@ -148,8 +146,8 @@ async fn calculate_distance(mut trigger: Output<'static, PIN_1>, mut echo: Input
     // stop measuring time (duration)
     let mut end_time = start_time.elapsed();
 
-    // calculate distance in cm
-    let distance = end_time.as_micros() as u32 * 343 / 2 / 10000;
+    // calculate distance in cm (the formula can be found in the datasheet)
+    let distance = end_time.as_micros() as u32 * SOUND_VELOCITY / 2 / 10000;
 
     channel_sender.send(distance).await;
 
@@ -157,6 +155,9 @@ async fn calculate_distance(mut trigger: Output<'static, PIN_1>, mut echo: Input
   }
 }
 
+
+// The task used to control the servomotor using PWM
+// In this context Forward means the motor is rotating to the left and Backward means the motor is rotating to the right
 #[embassy_executor::task]
 async fn servomotor(mut direction: Direction, mut servo: Pwm<'static, PWM_CH1>, mut config: PwmConfig) {
   let mut count = 0;
@@ -164,7 +165,7 @@ async fn servomotor(mut direction: Direction, mut servo: Pwm<'static, PWM_CH1>, 
       count += 1;
       match direction {
           Direction::Forward => {
-            if count == 9 {
+            if count == 4 {
               count = 0;
               direction = Direction::Backward;
             } else {
@@ -174,7 +175,7 @@ async fn servomotor(mut direction: Direction, mut servo: Pwm<'static, PWM_CH1>, 
             }
           }
           Direction::Backward => {
-            if count == 9 {
+            if count == 4 {
               count = 0;
               direction = Direction::Forward;
             } else {
@@ -188,6 +189,7 @@ async fn servomotor(mut direction: Direction, mut servo: Pwm<'static, PWM_CH1>, 
   }
 }
 
+// The task used to select which button is pressed
 #[embassy_executor::task]
 async fn buttons(mut stop_button: Input<'static, PIN_5>, mut submit_button: Input<'static, PIN_6>, channel_sender: Sender<'static, ThreadModeRawMutex, Button, 64>) {
   loop {
@@ -204,6 +206,7 @@ async fn buttons(mut stop_button: Input<'static, PIN_5>, mut submit_button: Inpu
   }
 }
 
+// Function used to map the keys on the 16x16 keypad
 fn map_button(column_index: usize, row_index: usize) -> &'static str {
   let map: [[&str; 4]; 4] = [
     ["1", "2", "3", "A"],
@@ -214,6 +217,7 @@ fn map_button(column_index: usize, row_index: usize) -> &'static str {
   return  map[row_index][column_index];
 }
 
+// Function used to get the input key from the keypad
 async fn keypad(column_1: &mut Output<'static, PIN_19>,
                 column_2: &mut Output<'static, PIN_18>,
                 column_3: &mut Output<'static, PIN_17>,
@@ -287,7 +291,7 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(peripherals.USB, Irqs);
     spawner.spawn(logger_task(driver)).unwrap();
 
-    // Display initialization
+    // Display initialization using I2C
     let sda = peripherals.PIN_14;
     let scl = peripherals.PIN_15;
 
@@ -304,16 +308,16 @@ async fn main(spawner: Spawner) {
     .with_reliable_init(10000)
     .build();
  
-    // motion sensor
+    // Spawn motion sensor task
     let motion_sensor = Input::new(peripherals.PIN_27, Pull::Up); 
     spawner.spawn(detect_motion(motion_sensor, MOTION_CHANNEL.sender())).unwrap();
 
-    // distance sensor
+    // Spawn distance sensor task
     let mut trigger = Output::new(peripherals.PIN_1, Level::Low);
     let mut echo =  Input::new(peripherals.PIN_2, Pull::None);
     spawner.spawn(calculate_distance(trigger, echo, DISTANCE_CHANNEL.sender())).unwrap();
     
-    // servomotor
+    // Configure PWM for servormotor and spwan the task
     let mut servo_config: PwmConfig = Default::default();
     servo_config.top = TOP_SERVO;
     servo_config.divider = FixedU16::<U4>::from_num(125);
@@ -321,18 +325,18 @@ async fn main(spawner: Spawner) {
     let mut servo = Pwm::new_output_b(peripherals.PWM_CH1, peripherals.PIN_3, servo_config.clone());
     spawner.spawn(servomotor(Direction::Backward, servo, servo_config)).unwrap();
     
-    // buzzer
+    // Configure PWM for buzzer
     let mut buzzer_config: PwmConfig = Default::default();
     buzzer_config.top = TOP_BUZZER;
     buzzer_config.compare_a = 0;
     let mut buzzer = Pwm::new_output_a(peripherals.PWM_CH2, peripherals.PIN_4, buzzer_config.clone());
     
-    // stop/submit button
+    // Spawn task for buttons
     let mut stop_button = Input::new(peripherals.PIN_5, Pull::Up);
     let mut submit_button = Input::new(peripherals.PIN_6, Pull::Up);
     spawner.spawn(buttons(stop_button, submit_button, BUTTON_CHANNEL.sender())).unwrap();
 
-    // keypad
+    // Keypad
     let mut column_4 = Output::new(peripherals.PIN_16, Level::Low);
     let mut column_3 = Output::new(peripherals.PIN_17, Level::Low);
     let mut column_2 = Output::new(peripherals.PIN_18, Level::Low);
@@ -344,7 +348,7 @@ async fn main(spawner: Spawner) {
     let mut row_1 = Input::new(peripherals.PIN_26, Pull::Down);
 
 
-    // microSD
+    // MicroSD initialization using SPI
     let mut micro_sd_cs = Output::new(peripherals.PIN_9, Level::High);
     let mut clk = peripherals.PIN_10;
     let mut mosi = peripherals.PIN_11;
@@ -366,7 +370,7 @@ async fn main(spawner: Spawner) {
 
     let mut volume_mgr = VolumeManager::new(sdcard, time_source);
 
-    
+  
     let mut volume0 = match volume_mgr.get_volume(VolumeIdx(0)) {
       Ok(volume) => volume, 
       Err(err) => {
@@ -387,6 +391,7 @@ async fn main(spawner: Spawner) {
 
     Timer::after_millis(100).await;
 
+    // print all files found in volume0
     volume_mgr
     .iterate_dir(&volume0, &root_dir, |ent| {
         info!(
@@ -402,18 +407,26 @@ async fn main(spawner: Spawner) {
     lcd.print("Checking...");
     loop {
   
+      // wait for the response from the motion and distance sensors
       let (motion, distance) = join(MOTION_CHANNEL.receive(), DISTANCE_CHANNEL.receive()).await;
-
+      Timer::after_millis(100).await;
       info!("Distance {}", distance);
       if motion == Motion::MotionDetected && distance <= PANIC_DISTANCE {
+
         // start buzzer
         buzzer_config.compare_a = buzzer_config.top / 10;
         buzzer.set_config(&buzzer_config);
 
+        lcd.clear();
+        lcd.print("Alarm tiggered");
+
+        Timer::after_millis(100).await;
+
+        // log trigger to the MicroSD
         let mut successful_write = false;
-        if let Ok(mut file) = volume_mgr.open_file_in_dir(&mut volume0, &root_dir, "data.txt", Mode::ReadWriteAppend) {
-          let _write_count = volume_mgr.write(&mut volume0, &mut file, b"alarm trigger").unwrap();
-          volume_mgr.close_file(&volume0, file).unwrap();
+        if let Ok(mut data_file) = volume_mgr.open_file_in_dir(&mut volume0, &root_dir, "data.txt", Mode::ReadWriteAppend) {
+          let _write_count = volume_mgr.write(&mut volume0, &mut data_file, b"alarm trigger\n").unwrap();
+          volume_mgr.close_file(&volume0, data_file).unwrap();
           successful_write = true;
         }
 
@@ -422,6 +435,10 @@ async fn main(spawner: Spawner) {
         } else {
           info!("Could not write to the microSD");
         }
+
+
+        // make sure that the channel is empty before waiting for select
+        while let Ok(_) = BUTTON_CHANNEL.try_receive() {}
 
         // the buzzer will stop if the correct code is introduced or if the timer expires
         let button_or_timeout = select(BUTTON_CHANNEL.receive(), Timer::after_secs(10)).await;
@@ -433,7 +450,6 @@ async fn main(spawner: Spawner) {
                     buzzer.set_config(&buzzer_config);
                     lcd.clear();
                     lcd.print("Alarm Stopped");
-                    
                   }
                   Button::SubmitButton => {
                       lcd.clear();
@@ -442,10 +458,9 @@ async fn main(spawner: Spawner) {
                       // get code from keypad
                       let code = keypad(&mut column_1, &mut column_2, &mut column_3, &mut column_4, &mut row_1, &mut row_2, &mut row_3, &mut row_4).await;
                      
-                      // display code on lcd and wait 3 seconds before checking the code
+                      // display code on lcd and wait 2 seconds before checking the code
                       lcd.print(&code);
-                      Timer::after_secs(3).await;
-
+                      Timer::after_secs(2).await;
                       info!("Code:{}", code);
 
                       // read password from microSD
@@ -472,16 +487,50 @@ async fn main(spawner: Spawner) {
                         info!("Could not read from microSD");
                       }
 
-                      // check if code is correct
+                      // check if code is the same as the password
                       // stop buzzer if code is correct
                       if password.as_bytes() == code.as_bytes() {
                         buzzer_config.compare_a = 0;
                         buzzer.set_config(&buzzer_config);
                         lcd.clear();
                         lcd.print("Correct code");
+
+                        // log succesful stop to the microSD
+                        let mut successful_write = false;
+                        if let Ok(mut correct_file) = volume_mgr.open_file_in_dir(&mut volume0, &root_dir, "correct.txt", Mode::ReadWriteAppend) {
+                          let _write_count = volume_mgr.write(&mut volume0, &mut correct_file, b"succesful stop using code\n").unwrap();
+                          volume_mgr.close_file(&volume0, correct_file).unwrap();
+                          successful_write = true;
+                        }
+
+                        if successful_write {
+                          info!("Success writing 'succesful stop' to the microSD");
+                        } else {
+                          info!("Could not write to the microSD");
+                        }
+
+
                       } else {
                         lcd.clear();
                         lcd.print("Incorrect code");
+                        Timer::after_secs(2).await; 
+                        buzzer_config.compare_a = 0;
+                        buzzer.set_config(&buzzer_config);
+
+                        // log unsuccesful stop to the microSD
+                        let mut successful_write = false;
+                        if let Ok(mut incorrect_file) = volume_mgr.open_file_in_dir(&mut volume0, &root_dir, "NOTCOR~1.TXT", Mode::ReadWriteAppend) {
+                          let _write_count = volume_mgr.write(&mut volume0, &mut incorrect_file, b"unsuccesful stop using code\n").unwrap();
+                          volume_mgr.close_file(&volume0, incorrect_file).unwrap();
+                          successful_write = true;
+                        }
+
+                        if successful_write {
+                          info!("Success writing 'unsuccesful stop' to the microSD");
+                        } else {
+                          info!("Could not write to the microSD");
+                        }
+                        
                       }
                   }
             }
@@ -489,6 +538,8 @@ async fn main(spawner: Spawner) {
           Second2(_) => {
             buzzer_config.compare_a = 0;
             buzzer.set_config(&buzzer_config);
+            lcd.clear();
+            lcd.print("Alarm stopped");
           }  
         }
       
